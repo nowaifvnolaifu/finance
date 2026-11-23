@@ -1,0 +1,571 @@
+// portfolio.cpp -- linear-algebra portfolio analysis with live price updates.
+//
+// C++17, no external libraries. Live prices come from the system `curl`
+// command (Yahoo Finance chart endpoint, via popen). Linear algebra
+// (Gaussian elimination, Jacobi eigen-solver) is implemented below.
+//
+// Build:   g++ -O2 -std=c++17 portfolio.cpp -o portfolio
+// History: a CSV with header "Date,QQQ,NVDA,..." and one row per trading day
+//          (oldest first, adjusted closes). Columns not in TICKERS are treated
+//          as candidates for the "other stocks" recommendations. Make one with:
+//            python -c "import yfinance as yf; yf.download(['QQQ','ANT','NVDA',
+//            'GH','SPCX','MRNA','TRI','VKTX','YU.L','SPY','SCHD','PG','JNJ',
+//            'TLT','GLD','BRK-B'],period='3y',auto_adjust=True)['Close']
+//            .to_csv('prices.csv')"
+// Run:
+//   ./portfolio --csv prices.csv --interval 60 --value 25000
+//   ./portfolio --csv prices.csv --once                (analysis only)
+//   ./portfolio --csv prices.csv --shares "NVDA=10,QQQ=5,YU.L=500"
+//   ./portfolio --demo --interval 1 --iterations 3     (offline test)
+//
+// Not financial advice. Free data is delayed; don't poll faster than ~30 s.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+using Vec = vector<double>;
+using Mat = vector<Vec>;
+
+// ------------------------------- CONFIG -------------------------------------
+static const vector<string> TICKERS = {"QQQ", "ANT", "NVDA", "GH", "SPCX",
+                                       "MRNA", "TRI", "VKTX", "YU.L"};
+static const string BENCHMARK = "QQQ";
+static const double TRADING_DAYS = 252, RISK_FREE = 0.04, MARKET_PREMIUM = 0.06;
+static const double HIST_WEIGHT = 0.30, SHRINK = 0.20;
+static const double NaN = numeric_limits<double>::quiet_NaN();
+
+// ---------------------------- LINEAR ALGEBRA --------------------------------
+Vec matvec(const Mat& A, const Vec& x) {
+    Vec y(A.size(), 0.0);
+    for (size_t i = 0; i < A.size(); i++)
+        for (size_t j = 0; j < x.size(); j++) y[i] += A[i][j] * x[j];
+    return y;
+}
+double dot(const Vec& a, const Vec& b) {
+    double s = 0;
+    for (size_t i = 0; i < a.size(); i++) s += a[i] * b[i];
+    return s;
+}
+// Solve A x = b by Gaussian elimination with partial pivoting.
+Vec solve(Mat A, Vec b) {
+    int n = (int)b.size();
+    for (int c = 0; c < n; c++) {
+        int p = c;
+        for (int r = c + 1; r < n; r++)
+            if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
+        swap(A[c], A[p]); swap(b[c], b[p]);
+        for (int r = c + 1; r < n; r++) {
+            double f = A[r][c] / A[c][c];
+            for (int k = c; k < n; k++) A[r][k] -= f * A[c][k];
+            b[r] -= f * b[c];
+        }
+    }
+    Vec x(n);
+    for (int i = n - 1; i >= 0; i--) {
+        double s = b[i];
+        for (int k = i + 1; k < n; k++) s -= A[i][k] * x[k];
+        x[i] = s / A[i][i];
+    }
+    return x;
+}
+// Cyclic Jacobi eigen-decomposition of a symmetric matrix.
+// Returns eigenvalues (descending) and eigenvectors as columns of V.
+void jacobiEigen(Mat A, Vec& vals, Mat& V) {
+    int n = (int)A.size();
+    V.assign(n, Vec(n, 0.0));
+    for (int i = 0; i < n; i++) V[i][i] = 1.0;
+    for (int sweep = 0; sweep < 100; sweep++) {
+        double off = 0;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) off += A[i][j] * A[i][j];
+        if (off < 1e-22) break;
+        for (int p = 0; p < n; p++)
+            for (int q = p + 1; q < n; q++) {
+                if (fabs(A[p][q]) < 1e-300) continue;
+                double th = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+                double t = (th >= 0 ? 1 : -1) / (fabs(th) + sqrt(th * th + 1));
+                double c = 1 / sqrt(t * t + 1), s = t * c;
+                for (int k = 0; k < n; k++) {
+                    double akp = A[k][p], akq = A[k][q];
+                    A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < n; k++) {
+                    double apk = A[p][k], aqk = A[q][k];
+                    A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk;
+                }
+                for (int k = 0; k < n; k++) {
+                    double vkp = V[k][p], vkq = V[k][q];
+                    V[k][p] = c * vkp - s * vkq; V[k][q] = s * vkp + c * vkq;
+                }
+            }
+    }
+    vector<int> idx(n);
+    for (int i = 0; i < n; i++) idx[i] = i;
+    sort(idx.begin(), idx.end(), [&](int a, int b) { return A[a][a] > A[b][b]; });
+    Vec v2(n); Mat V2(n, Vec(n));
+    for (int j = 0; j < n; j++) {
+        v2[j] = A[idx[j]][idx[j]];
+        for (int k = 0; k < n; k++) V2[k][j] = V[k][idx[j]];
+    }
+    vals = v2; V = V2;
+}
+
+// ------------------------------- DATA ---------------------------------------
+struct Data {
+    vector<string> names, dates;
+    Mat px;  // px[t][j], NaN = missing
+    int col(const string& n) const {
+        for (size_t j = 0; j < names.size(); j++) if (names[j] == n) return (int)j;
+        return -1;
+    }
+};
+
+string todayStr() {
+    time_t t = time(nullptr); char b[16];
+    strftime(b, sizeof b, "%Y-%m-%d", localtime(&t));
+    return b;
+}
+string nowStr() {
+    time_t t = time(nullptr); char b[24];
+    strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", localtime(&t));
+    return b;
+}
+void forwardFill(Data& d) {
+    for (size_t t = 1; t < d.px.size(); t++)
+        for (size_t j = 0; j < d.names.size(); j++)
+            if (isnan(d.px[t][j])) d.px[t][j] = d.px[t - 1][j];
+}
+bool loadCsv(const string& path, Data& d) {
+    ifstream f(path);
+    if (!f) return false;
+    string line;
+    getline(f, line);
+    {
+        stringstream ss(line); string c; getline(ss, c, ',');
+        while (getline(ss, c, ',')) {
+            while (!c.empty() && (c.back() == '\r' || c.back() == ' ')) c.pop_back();
+            d.names.push_back(c);
+        }
+    }
+    while (getline(f, line)) {
+        if (line.empty()) continue;
+        stringstream ss(line); string c;
+        getline(ss, c, ',');
+        d.dates.push_back(c.substr(0, 10));
+        Vec row;
+        while (getline(ss, c, ',')) {
+            char* e; double v = strtod(c.c_str(), &e);
+            row.push_back(e == c.c_str() ? NaN : v);
+        }
+        row.resize(d.names.size(), NaN);
+        d.px.push_back(row);
+    }
+    forwardFill(d);
+    return !d.px.empty();
+}
+Data syntheticData() {
+    mt19937 g(7); normal_distribution<double> N(0, 1);
+    Data d;
+    d.names = TICKERS;
+    for (string s : {"SPY", "SCHD", "PG", "JNJ", "TLT", "GLD"}) d.names.push_back(s);
+    int n = 756, k = (int)d.names.size();
+    Vec beta(k), idio(k), drift(k);
+    uniform_real_distribution<double> U(0, 1);
+    for (int j = 0; j < k; j++) {
+        beta[j] = 0.2 + 1.6 * U(g); idio[j] = 0.008 + 0.027 * U(g);
+        drift[j] = 0.0004 + 0.0004 * N(g);
+    }
+    Vec p(k, 100.0);
+    time_t t = time(nullptr) - 86400;
+    vector<string> rev;
+    while ((int)rev.size() < n) {
+        tm* lt = localtime(&t);
+        if (lt->tm_wday != 0 && lt->tm_wday != 6) {
+            char b[16]; strftime(b, sizeof b, "%Y-%m-%d", lt); rev.push_back(b);
+        }
+        t -= 86400;
+    }
+    reverse(rev.begin(), rev.end());
+    d.dates = rev;
+    for (int i = 0; i < n; i++) {
+        double m = 0.0005 + 0.011 * N(g);
+        for (int j = 0; j < k; j++)
+            p[j] *= exp(beta[j] * m + idio[j] * N(g) + drift[j]);
+        d.px.push_back(p);
+    }
+    return d;
+}
+
+// ---------------------------- LIVE PRICES -----------------------------------
+// Uses the system `curl`. Returns NaN if the request or parse fails.
+double fetchPrice(const string& sym) {
+    string enc;
+    for (char c : sym) enc += (c == '=') ? "%3D" : string(1, c);
+    string cmd = "curl -s -m 10 -A \"Mozilla/5.0\" "
+                 "\"https://query1.finance.yahoo.com/v8/finance/chart/" + enc +
+                 "?interval=1m&range=1d\"";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return NaN;
+    string out; char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
+    pclose(p);
+    size_t pos = out.find("\"regularMarketPrice\":");
+    if (pos == string::npos) return NaN;
+    return strtod(out.c_str() + pos + 21, nullptr);
+}
+
+// -------------------------- ANALYTICS CORE ----------------------------------
+Mat logReturns(const Mat& px) {
+    Mat r;
+    for (size_t t = 1; t < px.size(); t++) {
+        Vec row(px[t].size());
+        for (size_t j = 0; j < row.size(); j++) row[j] = log(px[t][j] / px[t - 1][j]);
+        r.push_back(row);
+    }
+    return r;
+}
+Mat shrunkCov(const Mat& R) {
+    int T = (int)R.size(), n = (int)R[0].size();
+    Vec mean(n, 0.0);
+    for (auto& r : R) for (int j = 0; j < n; j++) mean[j] += r[j] / T;
+    Mat S(n, Vec(n, 0.0));
+    for (auto& r : R)
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                S[i][j] += (r[i] - mean[i]) * (r[j] - mean[j]) / (T - 1) * TRADING_DAYS;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            S[i][j] = (i == j) ? S[i][j] : (1 - SHRINK) * S[i][j];
+    return S;  // diagonal kept, off-diagonals shrunk by SHRINK (same as (1-s)S + s*diag)
+}
+void expectedReturns(const Mat& R, const vector<string>& names, Vec& mu, Vec& beta) {
+    int T = (int)R.size(), n = (int)names.size();
+    Vec bench(T);
+    int bi = -1;
+    for (int j = 0; j < n; j++) if (names[j] == BENCHMARK) bi = j;
+    for (int t = 0; t < T; t++) {
+        if (bi >= 0) bench[t] = R[t][bi];
+        else { double s = 0; for (int j = 0; j < n; j++) s += R[t][j]; bench[t] = s / n; }
+    }
+    double bm = 0; for (double b : bench) bm += b / T;
+    double bv = 0; for (double b : bench) bv += (b - bm) * (b - bm) / (T - 1);
+    mu.assign(n, 0); beta.assign(n, 0);
+    for (int j = 0; j < n; j++) {
+        double m = 0; for (int t = 0; t < T; t++) m += R[t][j] / T;
+        double c = 0; for (int t = 0; t < T; t++) c += (R[t][j] - m) * (bench[t] - bm) / (T - 1);
+        beta[j] = c / bv;
+        double hist = max(-0.5, min(0.8, m * TRADING_DAYS));
+        double prior = RISK_FREE + beta[j] * MARKET_PREMIUM;
+        mu[j] = HIST_WEIGHT * hist + (1 - HIST_WEIGHT) * prior;
+    }
+}
+double portSharpe(const Vec& w, const Vec& mu, const Mat& S, double rf, double* ret = nullptr, double* vol = nullptr) {
+    double r = dot(w, mu), v = sqrt(max(1e-18, dot(w, matvec(S, w))));
+    if (ret) *ret = r;
+    if (vol) *vol = v;
+    return (r - rf) / v;
+}
+// Euclidean projection onto {0 <= w <= cap, sum w = 1} via bisection on the shift.
+Vec projectCappedSimplex(const Vec& v, double cap) {
+    double lo = *min_element(v.begin(), v.end()) - cap, hi = *max_element(v.begin(), v.end());
+    Vec w(v.size());
+    for (int it = 0; it < 100; it++) {
+        double tau = 0.5 * (lo + hi), s = 0;
+        for (size_t i = 0; i < v.size(); i++) s += min(cap, max(0.0, v[i] - tau));
+        (s > 1 ? lo : hi) = tau;
+    }
+    double tau = 0.5 * (lo + hi);
+    for (size_t i = 0; i < v.size(); i++) w[i] = min(cap, max(0.0, v[i] - tau));
+    return w;
+}
+// Long-only, position-capped optimization by projected gradient (multi-start).
+Vec optimizeLongOnly(const Vec& mu, const Mat& S, double rf, double maxW, bool sharpe) {
+    int n = (int)mu.size();
+    double cap = max(maxW, 1.0 / n + 1e-6);
+    auto f = [&](const Vec& w) {
+        return sharpe ? -portSharpe(w, mu, S, rf) : dot(w, matvec(S, w));
+    };
+    auto grad = [&](const Vec& w) {
+        Vec Sw = matvec(S, w), g(n);
+        if (!sharpe) { for (int i = 0; i < n; i++) g[i] = 2 * Sw[i]; return g; }
+        double r = dot(w, mu), s2 = max(1e-18, dot(w, Sw)), s = sqrt(s2);
+        for (int i = 0; i < n; i++) g[i] = -(mu[i] / s - (r - rf) * Sw[i] / (s2 * s));
+        return g;
+    };
+    mt19937 gen(1); exponential_distribution<double> E(1.0);
+    Vec best; double bestF = 1e300;
+    for (int start = 0; start < 5; start++) {
+        Vec w(n, 1.0 / n);
+        if (start > 0) { double s = 0; for (auto& x : w) { x = E(gen); s += x; } for (auto& x : w) x /= s; }
+        w = projectCappedSimplex(w, cap);
+        double step = 1.0, fw = f(w);
+        for (int it = 0; it < 3000; it++) {
+            Vec g = grad(w), v(n);
+            bool moved = false;
+            for (int ls = 0; ls < 40; ls++) {
+                for (int i = 0; i < n; i++) v[i] = w[i] - step * g[i];
+                Vec nw = projectCappedSimplex(v, cap);
+                double fn = f(nw);
+                if (fn < fw - 1e-14) { w = nw; fw = fn; step *= 1.5; moved = true; break; }
+                step *= 0.5;
+            }
+            if (!moved) break;
+        }
+        if (fw < bestF) { bestF = fw; best = w; }
+    }
+    return best;
+}
+
+struct Result {
+    Vec mu, beta, vol, w, wMinVar, wTan;
+    Mat cov, corr;
+    double ret, volP, sharpe, pc1, top3, eff, cond;
+    Vec pc1Load;
+};
+Result analyze(const Mat& px, const vector<string>& names, double maxW) {
+    Result r;
+    Mat R = logReturns(px);
+    int n = (int)names.size();
+    r.cov = shrunkCov(R);
+    expectedReturns(R, names, r.mu, r.beta);
+    r.vol.resize(n);
+    for (int i = 0; i < n; i++) r.vol[i] = sqrt(r.cov[i][i]);
+    r.corr.assign(n, Vec(n));
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) r.corr[i][j] = r.cov[i][j] / (r.vol[i] * r.vol[j]);
+    Vec ev; Mat V;
+    jacobiEigen(r.corr, ev, V);
+    double tot = 0; for (double e : ev) tot += e;
+    double H = 0;
+    for (double e : ev) if (e > 1e-12) H -= (e / tot) * log(e / tot);
+    r.eff = exp(H); r.pc1 = ev[0] / tot;
+    r.top3 = (ev[0] + ev[1] + ev[2]) / tot;
+    r.cond = ev.front() / max(1e-300, ev.back());
+    double sgn = 0; for (int i = 0; i < n; i++) sgn += V[i][0];
+    r.pc1Load.resize(n);
+    for (int i = 0; i < n; i++) r.pc1Load[i] = V[i][0] * (sgn < 0 ? -1 : 1);
+    // closed-form (shorts allowed): Sigma^-1 1  and  Sigma^-1 (mu - rf)
+    Vec ones(n, 1.0), ex(n);
+    for (int i = 0; i < n; i++) ex[i] = r.mu[i] - RISK_FREE;
+    Vec x = solve(r.cov, ones), y = solve(r.cov, ex);
+    double sx = 0, sy = 0; for (int i = 0; i < n; i++) { sx += x[i]; sy += y[i]; }
+    r.wMinVar = x; r.wTan = y;
+    for (int i = 0; i < n; i++) { r.wMinVar[i] /= sx; r.wTan[i] /= sy; }
+    r.w = optimizeLongOnly(r.mu, r.cov, RISK_FREE, maxW, true);
+    r.sharpe = portSharpe(r.w, r.mu, r.cov, RISK_FREE, &r.ret, &r.volP);
+    return r;
+}
+
+// ------------------------------ OUTPUT --------------------------------------
+void printStatic(const Result& r, const vector<string>& names, double value, double maxW) {
+    int n = (int)names.size();
+    cout << fixed << setprecision(3);
+    cout << "\n=== VOLATILITY & RISK ===\n"
+         << setw(7) << "" << setw(9) << "ann_vol" << setw(9) << "beta" << setw(10) << "exp_ret" << "\n";
+    for (int i = 0; i < n; i++)
+        cout << setw(7) << names[i] << setw(9) << r.vol[i] << setw(9) << r.beta[i] << setw(10) << r.mu[i] << "\n";
+    cout << "\nCorrelation matrix:\n" << setw(7) << "";
+    for (auto& s : names) cout << setw(7) << s;
+    cout << "\n";
+    for (int i = 0; i < n; i++) {
+        cout << setw(7) << names[i];
+        for (int j = 0; j < n; j++) cout << setw(7) << r.corr[i][j];
+        cout << "\n";
+    }
+    cout << setprecision(1) << "\nPC1 explains " << r.pc1 * 100 << "% of variance (common market factor); top 3 PCs: "
+         << r.top3 * 100 << "%\n" << "Effective independent bets: " << r.eff << " of " << n << "\n"
+         << "Correlation-matrix condition number: " << r.cond << "\n" << setprecision(3);
+    cout << "\n=== WEIGHTS ===\n" << setw(7) << "" << setw(14) << "MinVar(cf)" << setw(14) << "Tangency(cf)"
+         << setw(16) << "MaxSharpe L/O" << setw(12) << "$ alloc" << "   (cf = closed form, shorts allowed)\n";
+    for (int i = 0; i < n; i++)
+        cout << setw(7) << names[i] << setw(14) << r.wMinVar[i] << setw(14) << r.wTan[i]
+             << setw(16) << r.w[i] << setw(12) << setprecision(0) << r.w[i] * value << setprecision(3) << "\n";
+    cout << setprecision(1) << "\n=== EXPECTED OUTCOME (long-only max-Sharpe, cap " << maxW * 100 << "%) on $" << value << " ===\n"
+         << "exp return " << r.ret * 100 << "%  vol " << r.volP * 100 << "%  Sharpe " << setprecision(2) << r.sharpe
+         << setprecision(0) << "\nexp profit $" << r.ret * value << "/yr;  1-sigma range $" << (r.ret - r.volP) * value
+         << " to $" << (r.ret + r.volP) * value
+         << ";  1-mo 95% VaR $" << max(0.0, 1.645 * r.volP / sqrt(12.0) - r.ret / 12) * value << "\n";
+}
+
+void rankCandidates(const Data& d, const vector<string>& base, const Result& baseRes, double maxW) {
+    vector<int> bc;
+    for (auto& b : base) bc.push_back(d.col(b));
+    struct Row { string t; double corr, w, gain; };
+    vector<Row> rows;
+    // base Sharpe on the base-only data window
+    for (size_t j = 0; j < d.names.size(); j++) {
+        const string& c = d.names[j];
+        if (find(TICKERS.begin(), TICKERS.end(), c) != TICKERS.end()) continue;
+        Mat px; vector<string> nm = base; nm.push_back(c);
+        for (size_t t = 0; t < d.px.size(); t++) {
+            bool ok = !isnan(d.px[t][j]);
+            for (int b : bc) ok = ok && !isnan(d.px[t][b]);
+            if (!ok) continue;
+            Vec row; for (int b : bc) row.push_back(d.px[t][b]);
+            row.push_back(d.px[t][j]);
+            px.push_back(row);
+        }
+        if (px.size() < 250) continue;
+        Mat R = logReturns(px);
+        Mat S = shrunkCov(R); Vec mu, beta; expectedReturns(R, nm, mu, beta);
+        Vec w = optimizeLongOnly(mu, S, RISK_FREE, maxW, true);
+        double sh = portSharpe(w, mu, S, RISK_FREE);
+        // base-only Sharpe on this window with the base optimum weights
+        Mat Rb; for (auto& r : R) Rb.push_back(Vec(r.begin(), r.end() - 1));
+        Mat Sb = shrunkCov(Rb); Vec mub, bb; expectedReturns(Rb, base, mub, bb);
+        double shBase = portSharpe(baseRes.w, mub, Sb, RISK_FREE);
+        // correlation of candidate with current optimal portfolio
+        int T = (int)R.size(); Vec p(T), q(T);
+        for (int t = 0; t < T; t++) { p[t] = dot(Vec(R[t].begin(), R[t].end() - 1), baseRes.w); q[t] = R[t].back(); }
+        double pm = 0, qm = 0; for (int t = 0; t < T; t++) { pm += p[t] / T; qm += q[t] / T; }
+        double cpq = 0, cpp = 0, cqq = 0;
+        for (int t = 0; t < T; t++) { cpq += (p[t]-pm)*(q[t]-qm); cpp += (p[t]-pm)*(p[t]-pm); cqq += (q[t]-qm)*(q[t]-qm); }
+        rows.push_back({c, cpq / sqrt(cpp * cqq), w.back(), sh - shBase});
+    }
+    if (rows.empty()) { cout << "\n(no candidate columns with enough history in the CSV)\n"; return; }
+    sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.gain > b.gain; });
+    cout << fixed << setprecision(3)
+         << "\n=== CANDIDATES TO ADD (ranked by Sharpe gain after re-optimizing) ===\n"
+         << setw(9) << "ticker" << setw(14) << "corr_to_port" << setw(10) << "sugg_wt" << setw(13) << "sharpe_gain" << "\n";
+    for (size_t i = 0; i < min<size_t>(8, rows.size()); i++)
+        cout << setw(9) << rows[i].t << setw(14) << rows[i].corr << setw(10) << rows[i].w << setw(13) << rows[i].gain << "\n";
+}
+
+double usdPerShare(const string& t, double price, double fx) {
+    if (t == "YU.L") return price / 100.0 * fx;                          // pence -> GBP -> USD
+    if (t.size() > 2 && t.substr(t.size() - 2) == ".L") return price * fx;
+    return price;
+}
+map<string, double> parseShares(const string& s) {
+    map<string, double> m; stringstream ss(s); string kv;
+    while (getline(ss, kv, ',')) {
+        size_t e = kv.find('=');
+        if (e != string::npos) m[kv.substr(0, e)] = atof(kv.c_str() + e + 1);
+    }
+    return m;
+}
+
+// -------------------------------- MAIN --------------------------------------
+int main(int argc, char** argv) {
+    string csv, sharesArg; double value = 10000, maxW = 0.35;
+    int interval = 60, iterations = 0; bool demo = false, once = false;
+    for (int i = 1; i < argc; i++) {
+        string a = argv[i];
+        auto next = [&]() { return i + 1 < argc ? string(argv[++i]) : string(); };
+        if (a == "--csv") csv = next();
+        else if (a == "--value") value = atof(next().c_str());
+        else if (a == "--max-weight") maxW = atof(next().c_str());
+        else if (a == "--interval") interval = atoi(next().c_str());
+        else if (a == "--iterations") iterations = atoi(next().c_str());
+        else if (a == "--shares") sharesArg = next();
+        else if (a == "--demo") demo = true;
+        else if (a == "--once") once = true;
+    }
+    Data d;
+    if (demo) d = syntheticData();
+    else if (csv.empty() || !loadCsv(csv, d)) {
+        cerr << "Provide --csv prices.csv (see header comment) or use --demo\n";
+        return 1;
+    }
+    vector<string> names;
+    for (auto& t : TICKERS) {
+        if (d.col(t) >= 0) names.push_back(t);
+        else cerr << "WARNING: no column for " << t << " in the data (check ticker)\n";
+    }
+    if (names.size() < 2) { cerr << "Need at least 2 usable tickers.\n"; return 1; }
+    vector<int> bc; for (auto& t : names) bc.push_back(d.col(t));
+
+    // Base history: rows where every base ticker has a price.
+    Mat hist; vector<string> hdates;
+    for (size_t t = 0; t < d.px.size(); t++) {
+        bool ok = true; Vec row;
+        for (int j : bc) { ok = ok && !isnan(d.px[t][j]); row.push_back(d.px[t][j]); }
+        if (ok) { hist.push_back(row); hdates.push_back(d.dates[t]); }
+    }
+    if (hist.size() < 250)
+        cerr << "WARNING: only " << hist.size() << " overlapping days (<1 year); estimates unreliable.\n";
+
+    auto shares = parseShares(sharesArg);
+    Vec prevW; bool havePrev = false; int n = (int)names.size(), iter = 0;
+    Vec last = hist.back();
+    mt19937 gen(3); normal_distribution<double> N(0, 0.002);
+
+    {   // initial static report (history only)
+        Result r = analyze(hist, names, maxW);
+        cout << "\nLoaded " << hist.size() << " daily rows (" << hdates.front() << " -> " << hdates.back() << ")";
+        printStatic(r, names, value, maxW);
+        Data cd = d;  // candidates ranking uses full CSV
+        rankCandidates(cd, names, r, maxW);
+        if (once) return 0;
+    }
+    cout << "\nLive updates every " << interval << "s. Ctrl+C to stop.\n";
+
+    while (true) {
+        Vec latest(n, NaN); double fx = 1.27;
+        if (demo) { for (int j = 0; j < n; j++) latest[j] = last[j] *= exp(N(gen)); }
+        else {
+            for (int j = 0; j < n; j++) latest[j] = fetchPrice(names[j]);
+            bool lon = false; for (auto& t : names) if (t == "YU.L") lon = true;
+            if (lon) { double f = fetchPrice("GBPUSD=X"); if (!isnan(f)) fx = f; }
+        }
+        int missing = 0;
+        for (int j = 0; j < n; j++) if (isnan(latest[j])) { latest[j] = hist.back()[j]; missing++; }
+        if (missing == n) cerr << "[" << nowStr() << "] could not fetch any live price (is `curl` installed / online?); using last close\n";
+
+        // Splice today's live row onto history (replace if today's row exists).
+        Mat live = hist; string today = todayStr();
+        double prevClose[64];
+        bool todayRow = (hdates.back() == today);
+        for (int j = 0; j < n; j++) prevClose[j] = hist[todayRow ? hist.size() - 2 : hist.size() - 1][j];
+        if (todayRow) live.back() = latest; else live.push_back(latest);
+
+        Result r = analyze(live, names, maxW);
+        cout << "\n" << string(78, '=') << "\nUpdate " << nowStr() << "  (" << live.size() - 1 << " daily returns incl. live price)\n"
+             << fixed << setprecision(3) << setw(7) << "" << setw(10) << "price" << setw(10) << "day_%"
+             << setw(9) << "ann_vol" << setw(8) << "beta" << setw(9) << "exp_ret" << setw(9) << "weight"
+             << (havePrev ? "  d_weight" : "") << "\n";
+        for (int j = 0; j < n; j++) {
+            cout << setw(7) << names[j] << setw(10) << latest[j] << setw(10) << (latest[j] / prevClose[j] - 1) * 100
+                 << setw(9) << r.vol[j] << setw(8) << r.beta[j] << setw(9) << r.mu[j] << setw(9) << r.w[j];
+            if (havePrev) cout << setw(10) << r.w[j] - prevW[j];
+            cout << "\n";
+        }
+        cout << setprecision(1) << "\nPortfolio: exp return " << r.ret * 100 << "% | vol " << r.volP * 100 << "% | Sharpe "
+             << setprecision(2) << r.sharpe << " | exp profit on $" << setprecision(0) << value << ": $" << r.ret * value
+             << "/yr\nPC1 (market factor) " << r.pc1 * 100 << "% of variance | effective bets " << setprecision(1) << r.eff << "\n";
+
+        if (!shares.empty()) {
+            Vec usd(n); double tot = 0;
+            for (int j = 0; j < n; j++) {
+                auto it = shares.find(names[j]);
+                usd[j] = (it == shares.end() ? 0.0 : it->second) * usdPerShare(names[j], latest[j], fx);
+                tot += usd[j];
+            }
+            if (tot > 0) {
+                cout << setprecision(0) << "\nYour holdings: $" << tot << "\n" << setw(7) << "" << setw(10) << "now_$"
+                     << setw(8) << "now_%" << setw(10) << "target_%" << setw(15) << "trade_$(+buy)" << "\n";
+                for (int j = 0; j < n; j++)
+                    cout << setw(7) << names[j] << setw(10) << usd[j] << setw(8) << setprecision(1) << usd[j] / tot * 100
+                         << setw(10) << r.w[j] * 100 << setw(15) << setprecision(0) << r.w[j] * tot - usd[j] << "\n";
+            }
+        }
+        prevW = r.w; havePrev = true;
+        if (iterations && ++iter >= iterations) break;
+        this_thread::sleep_for(chrono::seconds(interval));
+    }
+    return 0;
+}
