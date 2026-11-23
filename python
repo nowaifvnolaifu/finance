@@ -1,0 +1,202 @@
+"""
+Live-updating portfolio analysis
+--------------------------------
+Links historical daily prices (past) with the latest market price (current) and
+re-runs the linear-algebra analysis every N seconds: covariance/volatility,
+max-Sharpe long-only weights, expected profit, and (optionally) the trades
+needed to rebalance your actual holdings.
+
+Requires portfolio_analysis.py in the same folder.
+
+    pip install numpy pandas scipy yfinance
+    python portfolio_live.py                              # refresh every 60s
+    python portfolio_live.py --interval 30 --value 25000
+    python portfolio_live.py --shares "NVDA=10,QQQ=5,VKTX=40,YU.L=500"
+    python portfolio_live.py --demo --interval 2 --iterations 3   # offline test
+
+Notes:
+- yfinance data is free but can be delayed (often ~15 min for some exchanges)
+  and is rate-limited; don't set the interval below ~15-30 seconds.
+- Outside market hours the "current" price is simply the last close.
+- Not financial advice.
+"""
+
+import argparse
+import time
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+import portfolio_analysis as pa
+
+PENCE_TICKERS = {"YU.L"}      # London prices come in pence (GBp), not pounds
+LONDON_SUFFIX = ".L"
+
+
+# ----------------------------------------------------------------------------
+# CURRENT PRICES
+# ----------------------------------------------------------------------------
+def fetch_latest(tickers):
+    """Most recent 1-minute price for each ticker (falls back to last close)."""
+    import yfinance as yf
+    px = yf.download(tickers, period="5d", interval="1m",
+                     auto_adjust=True, progress=False)["Close"]
+    if isinstance(px, pd.Series):
+        px = px.to_frame(tickers[0])
+    px = px.ffill()
+    return px.iloc[-1].dropna()
+
+
+class DemoFeed:
+    """Random-walk ticks so you can test the loop with no internet."""
+    def __init__(self, hist):
+        self.last = hist.iloc[-1].copy()
+        self.rng = np.random.default_rng(1)
+
+    def __call__(self, tickers):
+        self.last *= np.exp(self.rng.normal(0, 0.002, len(self.last)))
+        return self.last[tickers]
+
+
+# ----------------------------------------------------------------------------
+# PAST + CURRENT
+# ----------------------------------------------------------------------------
+def splice_today(hist, latest):
+    """Append (or overwrite) today's row with the current price so the newest
+    observation is included in the return/covariance estimates."""
+    today = pd.Timestamp(datetime.now().date())
+    live = hist.copy()
+    row = live.iloc[-1].copy()
+    row.update(latest)
+    if live.index[-1].normalize() == today:
+        live.iloc[-1] = row
+    else:
+        live.loc[today] = row
+    return live
+
+
+def to_value_per_share(ticker, price, fx):
+    """Price of one share in USD (pence -> pounds -> dollars for London)."""
+    if ticker in PENCE_TICKERS:
+        return price / 100 * fx
+    if ticker.endswith(LONDON_SUFFIX):
+        return price * fx
+    return price
+
+
+def parse_shares(s):
+    if not s:
+        return {}
+    return {k.strip().upper(): float(v)
+            for k, v in (p.split("=") for p in s.split(","))}
+
+
+# ----------------------------------------------------------------------------
+# ONE REFRESH
+# ----------------------------------------------------------------------------
+def analyze(live_prices, names, a, prev_w):
+    rets = np.log(live_prices[names]).diff().dropna()
+    cov = pa.shrunk_cov(rets)
+    mu, betas = pa.expected_returns(rets, cov)
+    w = pa.optimize_long_only(mu.values, cov, pa.RISK_FREE, a.max_weight)
+    ret, vol, sharpe = pa.stats(w, mu.values, cov, pa.RISK_FREE)
+    _, explained, eff_bets, _, _ = pa.eigen_analysis(cov, names)
+    return dict(rets=rets, cov=cov, mu=mu, betas=betas, w=w, ret=ret,
+                vol=vol, sharpe=sharpe, pc1=explained[0], eff=eff_bets,
+                dw=None if prev_w is None else w - prev_w)
+
+
+def render(res, names, latest, prev_close, a, shares, fx):
+    print("\n" + "=" * 78)
+    print(f"Update {datetime.now():%Y-%m-%d %H:%M:%S}   "
+          f"({len(res['rets'])} daily obs + live price)")
+    t = pd.DataFrame({
+        "price": latest[names],
+        "day_chg_%": (latest[names] / prev_close[names] - 1) * 100,
+        "ann_vol": np.sqrt(np.diag(res["cov"])),
+        "beta": res["betas"],
+        "exp_ret": res["mu"],
+        "weight": res["w"],
+    }, index=names)
+    if res["dw"] is not None:
+        t["d_weight"] = res["dw"]
+    print(t.to_string(float_format=lambda x: f"{x:,.3f}"))
+    print(f"\nPortfolio: exp return {res['ret']:.1%} | vol {res['vol']:.1%} | "
+          f"Sharpe {res['sharpe']:.2f} | exp profit on ${a.value:,.0f}: "
+          f"${res['ret'] * a.value:,.0f}/yr")
+    print(f"Market-factor share of variance (PC1): {res['pc1']:.0%} | "
+          f"effective bets: {res['eff']:.1f}")
+
+    if shares:
+        usd = pd.Series({t_: shares.get(t_, 0.0) *
+                         to_value_per_share(t_, latest[t_], fx) for t_ in names})
+        total = usd.sum()
+        if total > 0:
+            trade = pd.Series(res["w"], index=names) * total - usd
+            print(f"\nYour holdings: ${total:,.0f}")
+            print(pd.DataFrame({
+                "now_$": usd, "now_%": usd / total * 100,
+                "target_%": res["w"] * 100, "trade_$ (+buy/-sell)": trade,
+            }).to_string(float_format=lambda x: f"{x:,.1f}"))
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interval", type=int, default=60, help="seconds between updates")
+    ap.add_argument("--value", type=float, default=10000)
+    ap.add_argument("--max-weight", type=float, default=0.35)
+    ap.add_argument("--years", type=int, default=3)
+    ap.add_argument("--shares", type=str, default="",
+                    help='your holdings, e.g. "NVDA=10,QQQ=5"')
+    ap.add_argument("--iterations", type=int, default=0, help="0 = run forever")
+    ap.add_argument("--demo", action="store_true")
+    a = ap.parse_args()
+
+    shares = parse_shares(a.shares)
+    if a.demo:
+        hist = pa.synthetic_prices(pa.TICKERS)
+        feed = DemoFeed(hist)
+    else:
+        hist = pa.load_prices(pa.TICKERS, a.years)
+        feed = fetch_latest
+
+    names = [t for t in pa.TICKERS if t in hist.columns]
+    if len(names) < len(pa.TICKERS):
+        print("WARNING: dropped (no data):", set(pa.TICKERS) - set(names))
+    hist = hist[names].dropna(how="all").ffill()
+    prev_close = hist.iloc[-1]
+
+    prev_w, n = None, 0
+    print("Loaded history. Press Ctrl+C to stop.")
+    try:
+        while True:
+            try:
+                latest = feed(names)
+                fx = 1.27
+                if not a.demo and any(t.endswith(LONDON_SUFFIX) for t in names):
+                    try:
+                        fx = float(fetch_latest(["GBPUSD=X"]).iloc[0])
+                    except Exception:
+                        pass
+                live = splice_today(hist, latest)
+                # "previous close" = last fully completed day before today
+                today = pd.Timestamp(datetime.now().date())
+                base = hist[hist.index.normalize() < today]
+                prev_close = base.iloc[-1] if len(base) else hist.iloc[0]
+                res = analyze(live, names, a, prev_w)
+                render(res, names, latest.reindex(names), prev_close, a, shares, fx)
+                prev_w = res["w"]
+            except Exception as e:          # keep running through network blips
+                print(f"[{datetime.now():%H:%M:%S}] update failed: {e}")
+            n += 1
+            if a.iterations and n >= a.iterations:
+                break
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
